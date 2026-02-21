@@ -1,0 +1,6 @@
+cd "C:\Users\joyba\OneDrive\Desktop\joyxai-scraper"
+.\.venv\Scripts\python.exe .\scrape_contacts_from_sheet.py --sheet-id "1wuRJT4-RgUxJfpuDyM52PgDzEDJcL8s9Rn7OxM9bo_g" --gid 222389164 --service-account ".\service_account.json" --region SG --max-pages 4
+
+
+cd "C:\Users\joyba\OneDrive\Desktop\joyxai-scraper"
+.\.venv\Scripts\python.exe .\scrape_contacts_from_sheet.py --sheet-id "1wuRJT4-RgUxJfpuDyM52PgDzEDJcL8s9Rn7OxM9bo_g" --gid 222389164 --service-account ".\service_account.json" --region SG --max-pages 4 --concurrency 8 --page-concurrency 4

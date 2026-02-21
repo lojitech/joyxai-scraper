@@ -1,0 +1,1007 @@
+# scrape_contacts_from_sheet.py
+import argparse
+import asyncio
+import json
+import os
+import re
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional, List, Set, Tuple, Dict
+from urllib.parse import urljoin, urlparse
+# add near the other imports
+import random
+from gspread.exceptions import APIError
+
+
+import aiohttp
+import gspread
+import tldextract
+from bs4 import BeautifulSoup
+from bs4 import FeatureNotFound
+
+import phonenumbers
+from phonenumbers import PhoneNumberMatcher
+
+
+# -------------------------
+# Credentials (CSE)
+#   - Preferred: cse_credentials.py (not committed)
+#   - Fallback: env vars
+#     GOOGLE_API_KEY / GOOGLE_CX_ID
+#     GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX (also accepted)
+# -------------------------
+def load_cse_credentials() -> Tuple[str, str]:
+    try:
+        from cse_credentials import GOOGLE_API_KEY, GOOGLE_CX_ID  # type: ignore
+        return (str(GOOGLE_API_KEY or "").strip(), str(GOOGLE_CX_ID or "").strip())
+    except ImportError:
+        api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_CSE_API_KEY") or "").strip()
+        cx = (os.getenv("GOOGLE_CX_ID") or os.getenv("GOOGLE_CSE_CX") or "").strip()
+        return api_key, cx
+    except Exception as e:
+        raise RuntimeError(f"cse_credentials.py exists but failed to import: {type(e).__name__}: {e}") from e
+
+
+GOOGLE_API_KEY, GOOGLE_CX_ID = load_cse_credentials()
+
+
+# -------------------------
+# Config
+# -------------------------
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+CONTACT_HINTS = (
+    "contact", "contact-us", "contactus", "contacts",
+    "about", "about-us", "support", "help",
+    "customer-service", "customerservice",
+    "locations", "location", "office", "reach", "reach-us", "reachus",
+    "impressum", "legal", "privacy", "terms",
+)
+
+BAD_WEBSITE_HOST_CONTAINS = (
+    "linkedin.", "facebook.", "instagram.", "x.com", "twitter.",
+    "tiktok.", "youtube.",
+    "indeed.", "jobstreet.", "glassdoor.", "mycareersfuture.",
+    "recordowl.com", "sgpbusiness.com", "sgpgrid.com", "opencorporates.com",
+    "crunchbase.com", "zoominfo.", "dnb.", "yelp.", "yellowpages.",
+)
+
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+OBFUSCATED_EMAIL_RE = re.compile(
+    r"([a-zA-Z0-9._%+\-]+)\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*"
+    r"([a-zA-Z0-9.\-]+)\s*(?:\(|\[)?\s*(?:dot|\.)\s*(?:\)|\])?\s*"
+    r"([a-zA-Z]{2,})",
+    re.IGNORECASE,
+)
+
+ADDRESS_RULES = {
+    "SG": {
+        "country_re": re.compile(r"\b(singapore|sg)\b", re.IGNORECASE),
+        "postal_re": re.compile(r"\b\d{6}\b"),
+    },
+    "MY": {
+        "country_re": re.compile(r"\b(malaysia|my)\b", re.IGNORECASE),
+        "postal_re": re.compile(r"\b\d{5}\b"),
+    },
+}
+
+_TLD = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=False)
+
+
+# -------------------------
+# Sheet helpers
+# -------------------------
+def normalize_header(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[\s_\-]+", " ", s)
+    return s
+
+
+def find_header_index(headers: List[str], candidates: List[str]) -> Optional[int]:
+    norm_headers = [normalize_header(h) for h in headers]
+    cand = {normalize_header(c) for c in candidates}
+    for i, h in enumerate(norm_headers):
+        if h in cand:
+            return i
+    return None
+
+
+def find_website_index_strict(headers: List[str]) -> Optional[int]:
+    for i, h in enumerate(headers):
+        if (h or "").strip().lower() == "website":
+            return i
+    return None
+
+
+def ensure_columns(ws, headers: List[str], required: List[str]) -> List[str]:
+    out = list(headers)
+    changed = False
+    for col in required:
+        if col not in out:
+            out.append(col)
+            changed = True
+    if changed:
+        ws.resize(rows=ws.row_count, cols=len(out))
+        ws.update(values=[out], range_name="1:1")
+    return out
+
+
+def open_worksheet(sh, gid: Optional[int]):
+    if gid is None:
+        ws = sh.get_worksheet(0)
+        if ws is None:
+            raise RuntimeError("Spreadsheet has no worksheets.")
+        return ws
+
+    # Prefer get_worksheet_by_id when available
+    try:
+        ws = sh.get_worksheet_by_id(gid)
+        if ws is not None:
+            return ws
+    except Exception:
+        pass
+
+    for ws in sh.worksheets():
+        if getattr(ws, "id", None) == gid:
+            return ws
+
+    raise RuntimeError(f"Worksheet gid {gid} not found.")
+
+
+def cell(row: List[str], idx: Optional[int]) -> str:
+    if idx is None or idx < 0 or idx >= len(row):
+        return ""
+    return (row[idx] or "").strip()
+
+
+# -------------------------
+# URL/domain helpers
+# -------------------------
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
+    url = url.strip()
+    if not url:
+        return ""
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return "https://" + url
+
+
+def registrable_domain(url: str) -> str:
+    try:
+        host = urlparse(url).netloc
+        if not host:
+            return ""
+        ext = _TLD(host)
+        return (ext.top_domain_under_public_suffix or host).lower()
+    except Exception:
+        return ""
+
+
+def same_site(a: str, b: str) -> bool:
+    da = registrable_domain(a)
+    db = registrable_domain(b)
+    return bool(da) and da == db
+
+
+def is_bad_website(url: str) -> bool:
+    try:
+        u = normalize_url(url)
+        host = (urlparse(u).netloc or "").lower()
+        if not host:
+            return True
+        return any(x in host for x in BAD_WEBSITE_HOST_CONTAINS)
+    except Exception:
+        return True
+
+
+# -------------------------
+# Parsing
+# -------------------------
+def soup_from_html(html: str) -> BeautifulSoup:
+    try:
+        return BeautifulSoup(html, "lxml")
+    except FeatureNotFound:
+        return BeautifulSoup(html, "html.parser")
+
+
+def extract_emails_from_text(text: str) -> Set[str]:
+    found = set(m.group(0).lower() for m in EMAIL_RE.finditer(text or ""))
+    for m in OBFUSCATED_EMAIL_RE.finditer(text or ""):
+        found.add(f"{m.group(1)}@{m.group(2)}.{m.group(3)}".lower())
+    return {e for e in found if len(e) <= 254 and ".." not in e}
+
+
+def extract_phones_from_text(text: str, region: str) -> Set[str]:
+    phones: Set[str] = set()
+    if not text:
+        return phones
+    try:
+        for match in PhoneNumberMatcher(text, region):
+            num = match.number
+            if phonenumbers.is_possible_number(num) and phonenumbers.is_valid_number(num):
+                phones.add(phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164))
+    except Exception:
+        # PhoneNumberMatcher can throw on pathological input; skip rather than poisoning results
+        return phones
+    return phones
+
+
+def extract_address_from_text(text: str, region: str) -> str:
+    if not text:
+        return ""
+    rules = ADDRESS_RULES.get((region or "").upper(), ADDRESS_RULES["SG"])
+    country_re = rules["country_re"]
+    postal_re = rules["postal_re"]
+
+    lines = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln and ln.strip()]
+
+    for ln in lines:
+        if country_re.search(ln) and postal_re.search(ln):
+            ln2 = re.sub(r"\s+", " ", ln).strip()
+            return ln2[:220] if len(ln2) > 220 else ln2
+
+    for ln in lines:
+        if country_re.search(ln) and len(ln) <= 160:
+            ln2 = re.sub(r"\s+", " ", ln).strip()
+            return ln2
+
+    return ""
+
+
+def extract_jsonld_contacts_and_address(soup: BeautifulSoup, region: str) -> Tuple[Set[str], Set[str], str]:
+    emails: Set[str] = set()
+    phones: Set[str] = set()
+    best_addr = ""
+
+    def maybe_addr(s: str):
+        nonlocal best_addr
+        if best_addr:
+            return
+        cand = extract_address_from_text(s, region)
+        if cand:
+            best_addr = cand
+
+    def walk(obj):
+        nonlocal emails, phones
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if lk in ("email", "e-mail"):
+                    if isinstance(v, str):
+                        emails |= extract_emails_from_text(v)
+                    elif isinstance(v, list):
+                        for x in v:
+                            if isinstance(x, str):
+                                emails |= extract_emails_from_text(x)
+                if lk in ("telephone", "tel", "phone", "contactnumber", "contact_number"):
+                    if isinstance(v, str):
+                        phones |= extract_phones_from_text(v, region)
+                    elif isinstance(v, list):
+                        for x in v:
+                            if isinstance(x, str):
+                                phones |= extract_phones_from_text(x, region)
+                if lk in ("address", "streetaddress", "postalcode", "addresslocality", "addressregion", "addresscountry"):
+                    if isinstance(v, str):
+                        maybe_addr(v)
+                    elif isinstance(v, dict):
+                        maybe_addr(json.dumps(v, ensure_ascii=False))
+                walk(v)
+        elif isinstance(obj, list):
+            for x in obj:
+                walk(x)
+
+    for s in soup.find_all("script"):
+        t = (s.get("type") or "").lower().strip()
+        if t != "application/ld+json":
+            continue
+        raw = (s.string or s.get_text() or "").strip()
+        if not raw:
+            continue
+
+        emails |= extract_emails_from_text(raw)
+        phones |= extract_phones_from_text(raw, region)
+        maybe_addr(raw)
+
+        try:
+            data = json.loads(raw)
+            walk(data)
+        except Exception:
+            continue
+
+    return emails, phones, best_addr
+
+
+def parse_contacts_and_links(html: str, base_url: str, region: str) -> Tuple[Set[str], Set[str], str, List[str]]:
+    raw = html or ""
+
+    emails: Set[str] = set()
+    phones: Set[str] = set()
+    best_addr = ""
+
+    emails |= extract_emails_from_text(raw)
+    phones |= extract_phones_from_text(raw, region)
+    best_addr = extract_address_from_text(raw, region) or best_addr
+
+    soup = soup_from_html(raw)
+
+    for a in soup.select("a[href^='mailto:']"):
+        href = a.get("href", "")
+        mail = href.split("mailto:", 1)[-1].split("?", 1)[0].strip().lower()
+        if mail and EMAIL_RE.fullmatch(mail):
+            emails.add(mail)
+
+    for a in soup.select("a[href^='tel:']"):
+        href = a.get("href", "")
+        tel = href.split("tel:", 1)[-1].split("?", 1)[0].strip()
+        if tel:
+            phones.add(tel)
+
+    em_ld, ph_ld, addr_ld = extract_jsonld_contacts_and_address(soup, region)
+    emails |= em_ld
+    phones |= ph_ld
+    if addr_ld and not best_addr:
+        best_addr = addr_ld
+
+    for tag in soup(["style", "noscript"]):
+        tag.extract()
+    for s in soup.find_all("script"):
+        t = (s.get("type") or "").lower().strip()
+        if t != "application/ld+json":
+            s.extract()
+
+    text = soup.get_text(separator="\n", strip=True)
+    emails |= extract_emails_from_text(text)
+    phones |= extract_phones_from_text(text, region)
+    if not best_addr:
+        best_addr = extract_address_from_text(text, region) or best_addr
+
+    contact_links: List[str] = []
+    extra_links: List[str] = []
+    seen: Set[str] = set()
+
+    def add_link(u: str, contactish: bool):
+        if not u or u in seen:
+            return
+        seen.add(u)
+        (contact_links if contactish else extra_links).append(u)
+
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith("#"):
+            continue
+        abs_url = urljoin(base_url, href)
+        if not abs_url.startswith("http"):
+            continue
+        if not same_site(abs_url, base_url):
+            continue
+
+        path_lc = (urlparse(abs_url).path or "").lower()
+        anchor_lc = (a.get_text(" ", strip=True) or "").lower()
+        contactish = any(k in path_lc for k in CONTACT_HINTS) or any(k in anchor_lc for k in CONTACT_HINTS)
+        add_link(abs_url, contactish)
+
+    return emails, phones, best_addr, contact_links + extra_links[:10]
+
+
+# -------------------------
+# HTTP
+# -------------------------
+@dataclass
+class FetchResult:
+    final_url: Optional[str]
+    html: Optional[str]
+    status: int
+    content_type: str
+
+
+async def fetch_html(session: aiohttp.ClientSession, url: str, timeout_s: float, retries: int, backoff_base: float) -> FetchResult:
+    last = FetchResult(None, None, 0, "")
+    for attempt in range(max(1, retries + 1)):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_s), allow_redirects=True) as r:
+                ct = (r.headers.get("Content-Type") or "").lower()
+                status = r.status
+                if status >= 400:
+                    last = FetchResult(str(r.url), None, status, ct)
+                else:
+                    if ct and ("text/html" not in ct and "application/xhtml" not in ct):
+                        return FetchResult(str(r.url), None, status, ct)
+                    txt = await r.text(errors="ignore")
+                    return FetchResult(str(r.url), txt, status, ct)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+        except Exception:
+            pass
+
+        if attempt < retries:
+            await asyncio.sleep(backoff_base * (2 ** attempt))
+
+    return last
+
+
+async def google_cse_find_website(
+    session: aiohttp.ClientSession,
+    company: str,
+    api_key: str,
+    cx: str,
+    timeout_s: float,
+    retries: int,
+    backoff_base: float,
+) -> str:
+    endpoint = "https://www.googleapis.com/customsearch/v1"
+    queries = [f"{company} official website", company]
+
+    for q in queries:
+        for attempt in range(max(1, retries + 1)):
+            try:
+                async with session.get(
+                    endpoint,
+                    params={"key": api_key, "cx": cx, "q": q, "num": 5},
+                    timeout=aiohttp.ClientTimeout(total=timeout_s),
+                ) as r:
+                    data = await r.json(content_type=None)
+
+                if isinstance(data, dict) and "error" in data:
+                    code = (data["error"].get("code") or "")
+                    msg = (data["error"].get("message") or "")
+                    return f"__CSE_ERROR__::{code}::{msg}"
+
+                items = (data.get("items") or []) if isinstance(data, dict) else []
+                for item in items[:5]:
+                    link = (item.get("link") or "").strip()
+                    if not link.startswith("http"):
+                        continue
+                    if link.lower().endswith(".pdf"):
+                        continue
+                    if is_bad_website(link):
+                        continue
+                    return link
+
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+            except Exception:
+                pass
+
+            if attempt < retries:
+                await asyncio.sleep(backoff_base * (2 ** attempt))
+
+    return ""
+
+
+async def domain_guess_find_website(
+    company: str,
+    session: aiohttp.ClientSession,
+    timeout_s: float,
+    retries: int,
+    backoff_base: float,
+    region: str,
+) -> str:
+    name = (company or "").lower()
+    name = re.sub(r"[^\w\s]", " ", name)
+    for x in (
+        "pte ltd", "pvt ltd", "private limited", "limited", "ltd", "sdn bhd", "bhd",
+        "inc", "llc", "plc", "corp", "company", "group"
+    ):
+        name = name.replace(x, " ")
+    name = re.sub(r"\s+", " ", name).strip()
+    tokens = [t for t in name.split() if len(t) > 1]
+    if not tokens:
+        return ""
+
+    bases = [tokens[0]]
+    if len(tokens) >= 2:
+        bases += [tokens[0] + tokens[1], tokens[0] + "-" + tokens[1]]
+
+    ru = (region or "").upper()
+    if ru == "SG":
+        tlds = [".com.sg", ".sg", ".com"]
+    elif ru == "MY":
+        tlds = [".com.my", ".my", ".com"]
+    else:
+        tlds = [".com"]
+
+    for b in bases:
+        for tld in tlds:
+            for pref in ("https://www.", "https://", "http://www.", "http://"):
+                u = f"{pref}{b}{tld}"
+                res = await fetch_html(session, u, timeout_s, retries, backoff_base)
+                if res.final_url and not is_bad_website(res.final_url):
+                    return res.final_url
+    return ""
+
+
+async def find_official_website(
+    company: str,
+    session: aiohttp.ClientSession,
+    timeout_s: float,
+    retries: int,
+    backoff_base: float,
+    region: str,
+) -> Tuple[str, str]:
+    guess = await domain_guess_find_website(company, session, timeout_s, retries, backoff_base, region)
+    if guess and not is_bad_website(guess):
+        return guess, "Guess"
+
+    api_key = (GOOGLE_API_KEY or "").strip()
+    cx = (GOOGLE_CX_ID or "").strip()
+    if api_key and cx:
+        res = await google_cse_find_website(session, company, api_key, cx, timeout_s, retries, backoff_base)
+        if res.startswith("__CSE_ERROR__::"):
+            return "", res.replace("__CSE_ERROR__::", "CSE error: ")
+        if res:
+            return res, "CSE"
+
+    return "", "No website"
+
+
+# -------------------------
+# Crawl
+# -------------------------
+async def crawl_for_contacts(
+    session: aiohttp.ClientSession,
+    website: str,
+    max_pages: int,
+    region: str,
+    timeout_s: float,
+    retries: int,
+    backoff_base: float,
+    max_seconds: float,
+    sleep_s: float,
+    page_concurrency: int,
+) -> Tuple[Set[str], Set[str], str, str]:
+    t0 = time.time()
+
+    website = normalize_url(website)
+    if not website:
+        return set(), set(), "", "No website"
+    if is_bad_website(website):
+        return set(), set(), "", "Bad website domain"
+
+    home = await fetch_html(session, website, timeout_s, retries, backoff_base)
+    if not home.final_url or not home.html:
+        return set(), set(), "", "Homepage fetch failed"
+
+    p = urlparse(home.final_url)
+    base_url = f"{p.scheme}://{p.netloc}"
+
+    emails_all: Set[str] = set()
+    phones_all: Set[str] = set()
+    best_addr = ""
+
+    em, ph, addr, links = await asyncio.to_thread(parse_contacts_and_links, home.html, base_url, region)
+    emails_all |= em
+    phones_all |= ph
+    if addr:
+        best_addr = addr
+
+    q = deque([home.final_url] + links)
+    seen: Set[str] = set()
+
+    sem = asyncio.Semaphore(max(1, page_concurrency))
+
+    async def fetch_one(u: str) -> FetchResult:
+        async with sem:
+            return await fetch_html(session, u, timeout_s, retries, backoff_base)
+
+    inflight: List[asyncio.Task] = []
+
+    while q and len(seen) < max_pages:
+        if time.time() - t0 > max_seconds:
+            emails_all = {e for e in emails_all if not any(e.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp", ".gif"))}
+            return emails_all, phones_all, best_addr, "Timed out"
+
+        url = q.popleft()
+        if url in seen:
+            continue
+        seen.add(url)
+        if url == home.final_url:
+            continue
+
+        inflight.append(asyncio.create_task(fetch_one(url)))
+
+        if len(inflight) >= page_concurrency or not q or len(seen) >= max_pages:
+            done, _ = await asyncio.wait(inflight, return_when=asyncio.ALL_COMPLETED)
+            inflight = []
+
+            for d in done:
+                res = d.result()
+                if res.final_url and res.html:
+                    em2, ph2, addr2, links2 = await asyncio.to_thread(parse_contacts_and_links, res.html, base_url, region)
+                    emails_all |= em2
+                    phones_all |= ph2
+                    if addr2 and not best_addr:
+                        best_addr = addr2
+                    for l in links2:
+                        if l not in seen:
+                            q.append(l)
+
+            if sleep_s > 0 and q:
+                await asyncio.sleep(sleep_s)
+
+    emails_all = {e for e in emails_all if not any(e.lower().endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp", ".gif"))}
+    return emails_all, phones_all, best_addr, "OK"
+
+
+# -------------------------
+# Row processing + async pipeline
+# -------------------------
+async def process_company_row(
+    sheet_row: int,
+    company: str,
+    cur_w: str,
+    cur_e: str,
+    cur_p: str,
+    cur_a: str,
+    args,
+    http_session: aiohttp.ClientSession,
+    website_cache: Dict[str, Tuple[str, str]],
+    scrape_cache: Dict[str, Tuple[str, str, str, str]],
+    cache_lock: asyncio.Lock,
+) -> Tuple[int, Dict[str, str]]:
+    needs_w = args.overwrite or (not cur_w) or is_bad_website(cur_w)
+    needs_e = args.overwrite or (not cur_e)
+    needs_p = args.overwrite or (not cur_p)
+    needs_a = args.overwrite or (not cur_a)
+
+    if not (needs_w or needs_e or needs_p or needs_a):
+        return sheet_row, {}
+
+    website = normalize_url(cur_w) if (cur_w and not is_bad_website(cur_w)) else ""
+    src = ""
+    key = company.strip().lower()
+
+    if needs_w and not website:
+        async with cache_lock:
+            cached = website_cache.get(key)
+        if cached:
+            website, src = cached
+        else:
+            website, src = await find_official_website(
+                company=company,
+                session=http_session,
+                timeout_s=args.timeout,
+                retries=args.retries,
+                backoff_base=args.backoff,
+                region=args.region,
+            )
+            async with cache_lock:
+                website_cache[key] = (website, src)
+
+    emails_s = cur_e
+    phones_s = cur_p
+    addr_s = cur_a
+
+    if not website:
+        status = src if src else "No website"
+        up = {"Status": status}
+        if args.overwrite or not cur_w:
+            up["Website"] = ""
+        if args.overwrite or not cur_e:
+            up["Email"] = ""
+        if args.overwrite or not cur_p:
+            up["Phone"] = ""
+        if args.overwrite or not cur_a:
+            up["Address"] = ""
+        return sheet_row, up
+
+    dom = registrable_domain(website)
+    async with cache_lock:
+        cached2 = scrape_cache.get(dom)
+
+    if cached2:
+        cached_emails, cached_phones, cached_addr, cached_status = cached2
+        status = cached_status
+        if needs_e:
+            emails_s = cached_emails
+        if needs_p:
+            phones_s = cached_phones
+        if needs_a:
+            addr_s = cached_addr
+    else:
+        em_set, ph_set, addr_new, crawl_status = await crawl_for_contacts(
+            session=http_session,
+            website=website,
+            max_pages=args.max_pages,
+            region=args.region.upper(),
+            timeout_s=args.timeout,
+            retries=args.retries,
+            backoff_base=args.backoff,
+            max_seconds=args.max_seconds_per_company,
+            sleep_s=args.sleep,
+            page_concurrency=args.page_concurrency,
+        )
+        emails_new = "; ".join(sorted(em_set)) if em_set else ""
+        phones_new = "; ".join(sorted(ph_set)) if ph_set else ""
+        addr_new_s = addr_new or ""
+        async with cache_lock:
+            scrape_cache[dom] = (emails_new, phones_new, addr_new_s, crawl_status)
+
+        status = crawl_status
+        if needs_e:
+            emails_s = emails_new
+        if needs_p:
+            phones_s = phones_new
+        if needs_a:
+            addr_s = addr_new_s
+
+    up: Dict[str, str] = {"Status": f"{status} ({src})" if src and status == "OK" else status}
+    if needs_w:
+        up["Website"] = website
+    if needs_e:
+        up["Email"] = emails_s
+    if needs_p:
+        up["Phone"] = phones_s
+    if needs_a:
+        up["Address"] = addr_s
+
+    return sheet_row, up
+
+
+async def run_async_and_write(
+    args,
+    ws,
+    values: List[List[str]],
+    idx_company: int,
+    idx_website: int,
+    idx_email: int,
+    idx_phone: int,
+    idx_address: int,
+    idx_status: int,
+):
+    start_row = max(2, args.start_row)
+    total_rows = len(values)
+    last_row = total_rows if args.limit <= 0 else min(total_rows, start_row + args.limit - 1)
+    if last_row < start_row:
+        return
+
+    connector = aiohttp.TCPConnector(
+        limit=max(10, args.concurrency * 6),
+        ssl=False if args.insecure else None,
+    )
+    timeout = aiohttp.ClientTimeout(total=args.timeout)
+
+    website_cache: Dict[str, Tuple[str, str]] = {}
+    scrape_cache: Dict[str, Tuple[str, str, str, str]] = {}
+    cache_lock = asyncio.Lock()
+
+    work_q: asyncio.Queue = asyncio.Queue(maxsize=max(50, args.concurrency * 10))
+    result_q: asyncio.Queue = asyncio.Queue()
+
+    async with aiohttp.ClientSession(headers=DEFAULT_HEADERS, timeout=timeout, connector=connector) as http_session:
+        async def producer():
+            for sheet_row in range(start_row, last_row + 1):
+                row = values[sheet_row - 1]
+                company = cell(row, idx_company)
+                if not company:
+                    continue
+                await work_q.put((
+                    sheet_row,
+                    company,
+                    cell(row, idx_website),
+                    cell(row, idx_email),
+                    cell(row, idx_phone),
+                    cell(row, idx_address),
+                ))
+
+            for _ in range(args.concurrency):
+                await work_q.put(None)
+
+        async def worker():
+            while True:
+                item = await work_q.get()
+                if item is None:
+                    work_q.task_done()
+                    return
+
+                sheet_row, company, cur_w, cur_e, cur_p, cur_a = item
+                try:
+                    row_out, up = await asyncio.wait_for(
+                        process_company_row(
+                            sheet_row, company, cur_w, cur_e, cur_p, cur_a,
+                            args, http_session, website_cache, scrape_cache, cache_lock
+                        ),
+                        timeout=args.max_seconds_per_company + 10.0,
+                    )
+                    await result_q.put((row_out, up))
+                except asyncio.TimeoutError:
+                    await result_q.put((sheet_row, {"Status": "Timed out"}))
+                except Exception as e:
+                    await result_q.put((sheet_row, {"Status": f"Error: {type(e).__name__}"}))
+                finally:
+                    work_q.task_done()
+
+       # replace the writer() inside run_async_and_write() with this version
+        async def writer():
+            pending: List[gspread.Cell] = []
+            last_flush_ts = 0.0
+
+            def _api_status(e: Exception) -> Optional[int]:
+                resp = getattr(e, "response", None)
+                if resp is None:
+                    return None
+                return getattr(resp, "status_code", None) or getattr(resp, "status", None)
+
+            def _is_retryable(e: Exception) -> bool:
+                if isinstance(e, APIError):
+                    code = _api_status(e)
+                    if code in (429, 500, 502, 503, 504):
+                        return True
+                    return False
+                msg = str(e).lower()
+                return ("429" in msg) or ("rate limit" in msg) or ("quota" in msg) or ("backend error" in msg)
+
+            async def _update_cells_with_retry(batch: List[gspread.Cell]) -> None:
+                delay = 1.0
+                max_delay = 30.0
+                attempts = 7  # total tries
+
+                for i in range(attempts):
+                    try:
+                        await asyncio.to_thread(ws.update_cells, batch, value_input_option="RAW")
+                        return
+                    except Exception as e:
+                        if not _is_retryable(e) or i == attempts - 1:
+                            raise
+                        jitter = random.uniform(0.0, 0.3)
+                        await asyncio.sleep(min(max_delay, delay) + jitter)
+                        delay *= 2.0
+
+            async def flush():
+                nonlocal pending, last_flush_ts
+                if not pending:
+                    return
+
+                # keep write requests under ~60/min
+                now = time.time()
+                min_interval = 1.1
+                wait = (last_flush_ts + min_interval) - now
+                if wait > 0:
+                    await asyncio.sleep(wait)
+
+                batch = pending
+                pending = []
+                await _update_cells_with_retry(batch)
+                last_flush_ts = time.time()
+
+            while True:
+                item = await result_q.get()
+                try:
+                    if item is None:
+                        break
+
+                    sheet_row, up = item
+                    if not up:
+                        continue
+
+                    if "Website" in up:
+                        pending.append(gspread.Cell(sheet_row, idx_website + 1, up["Website"]))
+                    if "Email" in up:
+                        pending.append(gspread.Cell(sheet_row, idx_email + 1, up["Email"]))
+                    if "Phone" in up:
+                        pending.append(gspread.Cell(sheet_row, idx_phone + 1, up["Phone"]))
+                    if "Address" in up:
+                        pending.append(gspread.Cell(sheet_row, idx_address + 1, up["Address"]))
+                    if "Status" in up:
+                        pending.append(gspread.Cell(sheet_row, idx_status + 1, up["Status"]))
+
+                    if up.get("Status"):
+                        print(f"[row {sheet_row}] {up['Status']}", flush=True)
+
+                    if len(pending) >= args.batch_cells:
+                        await flush()
+                finally:
+                    result_q.task_done()
+
+            await flush()
+          
+
+
+        prod_task = asyncio.create_task(producer())
+        worker_tasks = [asyncio.create_task(worker()) for _ in range(args.concurrency)]
+        writer_task = asyncio.create_task(writer())
+
+        await prod_task
+        await work_q.join()
+        await asyncio.gather(*worker_tasks)
+
+        await result_q.put(None)
+        await writer_task
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sheet-id", required=True)
+    ap.add_argument("--gid", type=int, default=None)
+    ap.add_argument("--service-account", required=True)
+
+    ap.add_argument("--region", default="SG")
+    ap.add_argument("--max-pages", type=int, default=4)
+    ap.add_argument("--timeout", type=float, default=18.0)
+    ap.add_argument("--retries", type=int, default=1)
+    ap.add_argument("--backoff", type=float, default=0.4)
+    ap.add_argument("--sleep", type=float, default=0.15)
+    ap.add_argument("--max-seconds-per-company", type=float, default=25.0)
+    ap.add_argument("--start-row", type=int, default=2)
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--batch-cells", type=int, default=300)
+
+    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--page-concurrency", type=int, default=4)
+    ap.add_argument("--insecure", action="store_true")
+    args = ap.parse_args()
+
+    gc = gspread.service_account(filename=args.service_account)
+    sh = gc.open_by_key(args.sheet_id)
+    ws = open_worksheet(sh, args.gid)
+
+    values = ws.get_all_values()
+    if not values:
+        raise RuntimeError("Worksheet is empty.")
+
+    headers = values[0]
+
+    idx_company = find_header_index(headers, ["Company", "COMPANY", "Company Name", "Name"])
+    idx_website = find_website_index_strict(headers)
+    idx_email = find_header_index(headers, ["Email", "EMAIL", "Emails", "E-mail", "E-Mail"])
+    idx_phone = find_header_index(headers, ["Phone", "PHONE", "Phones", "Telephone", "Tel"])
+    idx_address = find_header_index(headers, ["Address", "ADDRESS"])
+    idx_status = find_header_index(headers, ["Status", "STATUS"])
+
+    if idx_company is None:
+        raise RuntimeError("Company column not found (Company/COMPANY/Company Name/Name).")
+
+    required: List[str] = []
+    if idx_website is None:
+        required.append("Website")
+    if idx_email is None:
+        required.append("Email")
+    if idx_phone is None:
+        required.append("Phone")
+    if idx_address is None:
+        required.append("Address")
+    if idx_status is None:
+        required.append("Status")
+
+    if required:
+        headers = ensure_columns(ws, headers, required)
+        idx_website = find_website_index_strict(headers)
+        idx_email = find_header_index(headers, ["Email", "EMAIL", "Emails", "E-mail", "E-Mail"])
+        idx_phone = find_header_index(headers, ["Phone", "PHONE", "Phones", "Telephone", "Tel"])
+        idx_address = find_header_index(headers, ["Address", "ADDRESS"])
+        idx_status = find_header_index(headers, ["Status", "STATUS"])
+
+    if None in (idx_website, idx_email, idx_phone, idx_address, idx_status):
+        raise RuntimeError("Website/Email/Phone/Address/Status columns not found/created.")
+
+    asyncio.run(
+        run_async_and_write(
+            args=args,
+            ws=ws,
+            values=values,
+            idx_company=idx_company,
+            idx_website=idx_website,
+            idx_email=idx_email,
+            idx_phone=idx_phone,
+            idx_address=idx_address,
+            idx_status=idx_status,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
